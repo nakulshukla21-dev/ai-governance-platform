@@ -1,0 +1,93 @@
+{
+  "version": "1.0.0",
+  "description": "Role-based access controls defining permitted query types and data access boundaries for the AI governance platform.",
+  "roles": [
+    {
+      "id": "admin",
+      "name": "Admin",
+      "description": "Full platform access including policy configuration, audit logs, and unrestricted operational queries.",
+      "permitted_query_types": [
+        "general",
+        "analytics",
+        "compliance_audit",
+        "policy_management",
+        "user_management",
+        "system_diagnostics",
+        "pii_lookup",
+        "third_party_integration"
+      ],
+      "restricted_query_types": [],
+      "pii_access": true,
+      "third_party_data_access": true
+    },
+    {
+      "id": "compliance-officer",
+      "name": "Compliance Officer",
+      "description": "Access to compliance reporting, policy violations, and regulated data subject to audit requirements.",
+      "permitted_query_types": [
+        "general",
+        "compliance_audit",
+        "policy_violation_report",
+        "regulatory_export",
+        "anonymized_analytics",
+        "pii_lookup"
+      ],
+      "restricted_query_types": [
+        "policy_management",
+        "user_management",
+        "system_diagnostics",
+        "third_party_integration"
+      ],
+      "pii_access": true,
+      "third_party_data_access": false
+    },
+    {
+      "id": "analyst",
+      "name": "Analyst",
+      "description": "Read-oriented access for governance metrics and trend analysis without direct PII or external data exposure.",
+      "permitted_query_types": [
+        "general",
+        "analytics",
+        "anonymized_analytics",
+        "dashboard_summary",
+        "policy_violation_report",
+        "knowledge_base"
+      ],
+      "restricted_query_types": [
+        "compliance_audit",
+        "policy_management",
+        "user_management",
+        "system_diagnostics",
+        "pii_lookup",
+        "regulatory_export",
+        "third_party_integration"
+      ],
+      "pii_access": false,
+      "third_party_data_access": false
+    },
+    {
+      "id": "customer-service",
+      "name": "Customer Service",
+      "description": "Frontline support access for customer-facing queries with limited PII visibility and no third-party data systems.",
+      "permitted_query_types": [
+        "general",
+        "customer_support",
+        "ticket_summary",
+        "knowledge_base"
+      ],
+      "restricted_query_types": [
+        "analytics",
+        "compliance_audit",
+        "policy_management",
+        "policy_violation_report",
+        "regulatory_export",
+        "user_management",
+        "system_diagnostics",
+        "pii_lookup",
+        "third_party_integration"
+      ],
+      "pii_access": false,
+      "third_party_data_access": false
+    }
+  ]
+}

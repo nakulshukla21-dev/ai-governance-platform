@@ -1,0 +1,8 @@
+# Production / Streamlit Cloud runtime (Linux-compatible).
+# pywin32 is intentionally omitted — the mcp package pulls it in only on Windows
+# (sys_platform == "win32"). Streamlit Cloud will not install pywin32.
+
+anthropic>=0.40.0
+python-dotenv>=1.0.0
+mcp>=1.24.0
+fastmcp>=2.0.0
