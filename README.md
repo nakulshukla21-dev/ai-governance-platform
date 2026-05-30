@@ -1,58 +1,194 @@
 # AI Governance Platform
 
-Policy engine (MCP server) and remediation agent for governed LLM interactions in financial services.
+A governed AI assistant for financial services teams. Every user message and model response is checked against organizational policies before and after the model answers — with clear outcomes for compliance, security, and audit.
 
-## Components
+---
 
-| File | Purpose |
-|------|---------|
-| `server.py` | FastMCP policy engine (stdio) — scans, roles, query classification |
-| `agent.py` | Remediation agent — connects to MCP, enforces policies, calls Claude |
-| `config/policies.json` | Detection policies (PII, prompt injection, etc.) |
-| `config/roles.json` | Role-based query permissions |
+## Part 1 — Overview (for business & compliance stakeholders)
 
-## Setup
+### What is this?
+
+The AI Governance Platform wraps a large language model (Claude) in a **policy enforcement layer** designed for regulated environments. Users interact through a familiar chat interface, but the system:
+
+- Verifies **who** is asking (role-based access)
+- Scans **what** they send and **what** the model returns
+- Takes **automatic action** when policies are violated (block, redact, warn, or escalate)
+- Leaves an **audit trail** for reviewers
+
+Think of it as guardrails plus a paper trail — not just a chatbot.
+
+### Who is it for?
+
+| Role | Typical use |
+|------|-------------|
+| **Admin** | Full access, policy and user management |
+| **Compliance Officer** | Audits, regulatory exports, PII-related lookups |
+| **Analyst** | Analytics and dashboards (no direct PII access) |
+| **Customer Service** | General support and knowledge base (restricted sensitive queries) |
+
+Roles are enforced before the model is called, so unauthorized query types are stopped early with a plain-language explanation.
+
+### Key features
+
+**Governed chat**
+
+- Role selector drives what each user is allowed to ask
+- Responses include a collapsible **Governance Details** panel (query type, authorization, policies scanned, violations, remediation)
+- Violations are color-coded by severity (critical → low)
+
+**Policy engine**
+
+Six built-in policies (configurable via `config/policies.json`):
+
+| Policy | What it catches | Typical action |
+|--------|-----------------|----------------|
+| PII detection | Emails, phones, SSNs, card numbers | Redact |
+| Prompt injection | Jailbreaks, instruction overrides | Block |
+| Confidential data | Internal / unreleased business information | Escalate |
+| Harmful content | Violence, self-harm, illegal instructions | Block |
+| Toxicity | Harassment, hate speech | Warn |
+| Named entity PII | Person / org / location identifiers | Redact |
+
+Detection combines **rules (regex)** and **AI scoring (Claude Haiku)** where configured.
+
+**Near-miss flagging**
+
+When content scores close to a policy threshold but does not quite trigger a violation, the system records a **near miss** — useful for tuning policies before real incidents occur.
+
+**Escalation queue**
+
+Compliance reviewers see session items that need attention:
+
+- Escalations (e.g. confidential-data policy)
+- Near misses (threshold tuning candidates)
+
+Reviewers can mark items True Positive / False Positive / Near Miss, add notes, and **adjust thresholds** for near-miss policies.
+
+**Audit trail**
+
+Every interaction in a session is logged with timestamp, role, violations, blocks, and escalations. Export to CSV for offline review.
+
+**Policy versioning**
+
+Policy changes (manual save or file upload) are snapshotted in the UI. Previous versions can be **restored** with a full history of what changed and when.
+
+### How it works (high level)
+
+```mermaid
+flowchart LR
+    subgraph User
+        U[User message]
+    end
+
+    subgraph Governance
+        R[Role check]
+        IN[Input policy scan]
+        LLM[Claude Sonnet]
+        OUT[Output policy scan]
+        REM[Remediation]
+    end
+
+    subgraph Outcomes
+        A[Approved response]
+        B[Blocked / redacted]
+        E[Escalation queue]
+    end
+
+    U --> R
+    R -->|not permitted| B
+    R -->|permitted| IN
+    IN -->|block| B
+    IN -->|redact / warn / escalate| LLM
+    LLM --> OUT
+    OUT --> REM
+    REM --> A
+    REM --> B
+    REM --> E
+```
+
+1. **Classify** the query type and check it against the user’s role.  
+2. **Scan input** against all enabled input policies.  
+3. If allowed, **generate** an answer with Claude Sonnet (using governed system instructions).  
+4. **Scan output** and apply the same remediation rules.  
+5. **Record** the result for audit and escalation review.
+
+---
+
+## Part 2 — Technical documentation
+
+### Architecture
+
+| Component | File | Role |
+|-----------|------|------|
+| Policy engine (MCP) | `server.py` | Loads policies/roles; exposes scan and classify tools over stdio |
+| Remediation agent | `agent.py` | Orchestrates MCP + Sonnet; applies block/redact/warn/escalate |
+| Web UI | `app.py` | Streamlit: chat, policy dashboard, audit trail, escalation queue |
+| Policies | `config/policies.json` | Detection rules, thresholds, actions |
+| Roles | `config/roles.json` | Permitted / restricted query types per role |
+
+The agent **spawns** `server.py` as a subprocess for each interaction (stdio MCP). Policy file changes on disk are picked up on the next subprocess start.
+
+### Requirements
+
+- Python 3.11+ (3.14 tested locally)
+- [Anthropic API key](https://console.anthropic.com/) (`ANTHROPIC_API_KEY`)
+- See `requirements.txt` (runtime) and `requirements-dev.txt` (+ pytest)
+
+**Note on `pywin32`:** It is **not** pinned in `requirements.txt`. The `mcp` package installs it only on Windows (`sys_platform == "win32"`). **Streamlit Cloud (Linux) does not install pywin32.**
+
+### Setup
 
 ```bash
+git clone https://github.com/nakulshukla21-dev/ai-governance-platform.git
+cd ai-governance-platform
+
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# macOS/Linux
+# macOS / Linux
 source .venv/bin/activate
 
 pip install -r requirements-dev.txt
 cp .env.example .env
-# Edit .env and set ANTHROPIC_API_KEY
+# Edit .env and set ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## Dependencies and `pywin32`
+### Run the Streamlit app (local)
 
-`requirements.txt` does **not** include `pywin32` or Streamlit. On Windows, `mcp` may install `pywin32` automatically (`pywin32>=310; sys_platform == "win32"`). **Streamlit Cloud runs Linux** and will not install `pywin32`.
-
-For local development only, avoid polluting deploy pins:
+Default local port is **8503** (see `.streamlit/config.toml`) to avoid clashing with other apps on 8501/8502.
 
 ```bash
-pip install -r requirements-dev.txt   # not a frozen export from .venv
+streamlit run app.py
+# or
+.\run_app.ps1
 ```
 
-## Tests
+Override port:
 
 ```bash
-# Unit tests only (no API key required)
-pytest test_agent.py -m "not integration" -v
-
-# Full suite (requires ANTHROPIC_API_KEY)
-pytest test_agent.py -v
+streamlit run app.py --server.port 8504
 ```
 
-## MCP server (Cursor / Claude Desktop)
+**Streamlit Community Cloud** ignores `server.port` in config and serves on **8501**. Set `ANTHROPIC_API_KEY` in app secrets. Use `requirements.txt` as the packages file.
+
+### Run the MCP server standalone (optional)
+
+Used by Cursor / Claude Desktop or for debugging — not for end users:
+
+```bash
+python server.py
+```
+
+The process waits on stdio; Ctrl+C exits with a normal `KeyboardInterrupt` traceback.
+
+### MCP client configuration (Cursor)
 
 ```json
 {
   "mcpServers": {
     "ai-governance": {
       "command": "python",
-      "args": ["/path/to/ai-governance-platform/server.py"],
+      "args": ["C:/path/to/ai-governance-platform/server.py"],
       "env": {
         "ANTHROPIC_API_KEY": "your-key"
       }
@@ -61,20 +197,56 @@ pytest test_agent.py -v
 }
 ```
 
-## Streamlit UI
-
-**Local** (port **8503** via `.streamlit/config.toml` — 8501 = AML knowledge base, 8502 = other app):
+### Tests
 
 ```bash
-streamlit run app.py
-# or
-.\run_app.ps1
-# different port if needed:
-streamlit run app.py --server.port 8504
+# Unit tests only (no API key)
+pytest test_agent.py -m "not integration" -v
+
+# Full suite including live API + MCP
+pytest test_agent.py -v
 ```
 
-**Streamlit Community Cloud** ignores `server.port` in config and serves on **8501** automatically.
+Integration tests are skipped automatically when `ANTHROPIC_API_KEY` is unset (`conftest.py`).
 
-Use `requirements.txt` as your Streamlit Cloud `packages` file (includes `streamlit`, no `pywin32`).
+### Policy configuration
 
-**Note:** The agent spawns `server.py` as a subprocess; hosted Streamlit needs `ANTHROPIC_API_KEY` in app secrets.
+- **Per-scope thresholds** in `thresholds.input` / `thresholds.output`
+- **LLM policies** return `violation_confidence` (0.0–1.0); detection requires `detected` and confidence ≥ threshold (ensemble also allows regex hits)
+- **Near miss:** non-detected scan with confidence in `[threshold × 0.9, threshold)`
+
+### Limitations
+
+| Area | Limitation |
+|------|------------|
+| **Hosting** | Streamlit Cloud must spawn `server.py` subprocess with network access for Anthropic; cold starts and timeouts may apply |
+| **Session scope** | Audit trail and escalation queue are **per browser session** only — not persisted to a database |
+| **LLM variability** | Query classification and policy scoring use Haiku/Sonnet; results can vary slightly between runs |
+| **Near misses** | Require LLM scan confidence in the near-miss band; regex-only near misses are uncommon |
+| **Role enforcement** | Based on predicted query type, not manual user attestation |
+| **Policy updates** | Saved/uploaded policies apply to **new** MCP subprocesses; in-flight chats use policies loaded at scan time |
+| **Output blocking** | A blocked output replaces the model answer with an explanation — no partial response |
+| **Scale** | Designed for demonstration and team pilots, not high-volume production without adding persistence, auth, and async job queues |
+| **Subprocess overhead** | Each chat message starts an MCP server process — adds latency vs embedded library calls |
+
+### Repository structure
+
+```
+ai-governance-platform/
+├── app.py                 # Streamlit UI
+├── agent.py               # Remediation agent
+├── server.py              # MCP policy engine
+├── config/
+│   ├── policies.json
+│   └── roles.json
+├── test_agent.py
+├── conftest.py
+├── requirements.txt
+├── requirements-dev.txt
+├── run_app.ps1
+└── .streamlit/config.toml
+```
+
+### License
+
+Add your organization’s license terms here if open-sourcing or distributing internally.
