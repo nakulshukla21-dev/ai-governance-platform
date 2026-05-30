@@ -7,11 +7,13 @@ and produces governed responses via Claude Sonnet.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import sys
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +36,7 @@ SONNET_MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 REDACTED_PLACEHOLDER = "[REDACTED]"
 NEAR_MISS_MARGIN = 0.10
+MCP_INTERACTION_TIMEOUT_SECONDS = 600
 
 BLOCKED_AUTHORIZATION_MESSAGE = (
     "Your request cannot be processed because your role is not authorized "
@@ -103,6 +106,15 @@ def _server_env() -> dict[str, str]:
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
     return env
+
+
+def _stdio_server_params() -> StdioServerParameters:
+    return StdioServerParameters(
+        command=sys.executable,
+        args=[str(SERVER_SCRIPT)],
+        env=_server_env(),
+        cwd=str(ROOT_DIR),
+    )
 
 
 def _parse_tool_result(result: CallToolResult) -> Any:
@@ -455,15 +467,14 @@ def _build_blocked_result(
     )
 
 
-async def process_interaction(
+async def _process_interaction_with_session(
+    session: ClientSession,
     user_input: str,
     role_id: str,
-    conversation_history: list[dict[str, Any]] | None = None,
+    conversation_history: list[dict[str, Any]],
 ) -> InteractionResult:
-    """
-    Run the full governance pipeline: authorize, scan input, generate response, scan output.
-    """
-    history = conversation_history or []
+    """Governance pipeline using an already-initialized MCP session."""
+    history = conversation_history
     remediation_actions: list[RemediationAction] = []
     input_scan_results: list[dict[str, Any]] = []
     output_scan_results: list[dict[str, Any]] = []
@@ -478,197 +489,311 @@ async def process_interaction(
 
     anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
 
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(SERVER_SCRIPT)],
-        env=_server_env(),
-        cwd=str(ROOT_DIR),
+    classification = await _call_mcp_tool(
+        session,
+        "classify_query",
+        {"text": user_input, "role_id": role_id},
+    )
+    permitted = bool(classification.get("permitted"))
+    authorized = permitted
+    class_info = classification.get("classification") or {}
+    query_type = class_info.get("query_type")
+
+    if not permitted:
+        reason = classification.get("reason", "Query not permitted for this role.")
+        explanation = await _explain_remediation(
+            anthropic_client,
+            phase="authorization",
+            action="block",
+            policy_id=None,
+            reasoning=reason,
+            original_snippet=user_input,
+        )
+        remediation_actions.append(
+            RemediationAction(
+                phase="authorization",
+                action="block",
+                policy_id=None,
+                reasoning=reason,
+                user_explanation=explanation,
+            )
+        )
+        return _build_blocked_result(
+            user_input=user_input,
+            processed_input=user_input,
+            role_id=role_id,
+            query_type=query_type,
+            authorized=False,
+            input_scan_results=[],
+            output_scan_results=[],
+            violations=[],
+            remediation_actions=remediation_actions,
+            final_response=explanation or BLOCKED_AUTHORIZATION_MESSAGE,
+            requires_escalation=False,
+            near_misses=[],
+        )
+
+    input_scan_results = await _call_mcp_tool(
+        session,
+        "scan_input",
+        {"text": user_input, "policy_ids": []},
+    )
+    if not isinstance(input_scan_results, list):
+        input_scan_results = []
+
+    if _has_blocking_detection(input_scan_results):
+        violations = _violations_from_scans(input_scan_results)
+        blockers = [v for v in violations if v.get("action") == "block"]
+        policy_id = blockers[0].get("policy_id") if blockers else None
+        reasoning = (
+            f"Autonomous remediation: input blocked because policy '{policy_id}' "
+            "detected a violation with action=block."
+        )
+        explanation = await _explain_remediation(
+            anthropic_client,
+            phase="input",
+            action="block",
+            policy_id=policy_id,
+            reasoning=reasoning,
+            original_snippet=user_input,
+        )
+        remediation_actions.append(
+            RemediationAction(
+                phase="input",
+                action="block",
+                policy_id=policy_id,
+                reasoning=reasoning,
+                user_explanation=explanation,
+            )
+        )
+        input_near_misses = _collect_near_misses(input_scan_results, "input")
+        return _build_blocked_result(
+            user_input=user_input,
+            processed_input=user_input,
+            role_id=role_id,
+            query_type=query_type,
+            authorized=True,
+            input_scan_results=input_scan_results,
+            output_scan_results=[],
+            violations=violations,
+            remediation_actions=remediation_actions,
+            final_response=explanation or BLOCKED_POLICY_MESSAGE,
+            requires_escalation=False,
+            near_misses=input_near_misses,
+        )
+
+    processed_input = _redact_text(user_input, input_scan_results)
+    requires_escalation = await _record_scan_remediations(
+        anthropic_client,
+        phase="input",
+        text=user_input,
+        scan_results=input_scan_results,
+        remediation_actions=remediation_actions,
+        requires_escalation=requires_escalation,
     )
 
-    async with stdio_client(server_params) as (read_stream, write_stream):
+    llm_response = await _generate_llm_response(
+        anthropic_client,
+        processed_input,
+        history,
+    )
+
+    output_scan_results = await _call_mcp_tool(
+        session,
+        "scan_output",
+        {"text": llm_response, "policy_ids": []},
+    )
+    if not isinstance(output_scan_results, list):
+        output_scan_results = []
+
+    violations = _violations_from_scans(input_scan_results) + _violations_from_scans(
+        output_scan_results
+    )
+    final_response = llm_response
+    was_blocked = False
+
+    if _has_blocking_detection(output_scan_results):
+        was_blocked = True
+        out_violations = _violations_from_scans(output_scan_results)
+        blockers = [v for v in out_violations if v.get("action") == "block"]
+        policy_id = blockers[0].get("policy_id") if blockers else None
+        reasoning = (
+            f"Autonomous remediation: output blocked because policy '{policy_id}' "
+            "detected a violation with action=block."
+        )
+        explanation = await _explain_remediation(
+            anthropic_client,
+            phase="output",
+            action="block",
+            policy_id=policy_id,
+            reasoning=reasoning,
+            original_snippet=llm_response,
+        )
+        remediation_actions.append(
+            RemediationAction(
+                phase="output",
+                action="block",
+                policy_id=policy_id,
+                reasoning=reasoning,
+                user_explanation=explanation,
+            )
+        )
+        final_response = explanation or BLOCKED_OUTPUT_MESSAGE
+    else:
+        redacted_output = _redact_text(llm_response, output_scan_results)
+        if redacted_output != llm_response:
+            final_response = redacted_output
+        requires_escalation = await _record_scan_remediations(
+            anthropic_client,
+            phase="output",
+            text=llm_response,
+            scan_results=output_scan_results,
+            remediation_actions=remediation_actions,
+            requires_escalation=requires_escalation,
+        )
+
+    near_misses = _collect_near_misses(
+        input_scan_results, "input"
+    ) + _collect_near_misses(output_scan_results, "output")
+
+    return InteractionResult(
+        original_input=user_input,
+        processed_input=processed_input,
+        role_id=role_id,
+        query_type=query_type,
+        authorized=authorized,
+        input_scan_results=input_scan_results,
+        output_scan_results=output_scan_results,
+        violations=violations,
+        remediation_actions=[a.to_dict() for a in remediation_actions],
+        final_response=final_response,
+        was_blocked=was_blocked,
+        requires_escalation=requires_escalation,
+        near_misses=near_misses,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+async def process_interaction(
+    user_input: str,
+    role_id: str,
+    conversation_history: list[dict[str, Any]] | None = None,
+) -> InteractionResult:
+    """
+    Run the full governance pipeline with a one-shot MCP subprocess (CLI/tests).
+    """
+    history = conversation_history or []
+    async with stdio_client(_stdio_server_params()) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
-
-            classification = await _call_mcp_tool(
-                session,
-                "classify_query",
-                {"text": user_input, "role_id": role_id},
-            )
-            permitted = bool(classification.get("permitted"))
-            authorized = permitted
-            class_info = classification.get("classification") or {}
-            query_type = class_info.get("query_type")
-
-            if not permitted:
-                reason = classification.get("reason", "Query not permitted for this role.")
-                explanation = await _explain_remediation(
-                    anthropic_client,
-                    phase="authorization",
-                    action="block",
-                    policy_id=None,
-                    reasoning=reason,
-                    original_snippet=user_input,
-                )
-                remediation_actions.append(
-                    RemediationAction(
-                        phase="authorization",
-                        action="block",
-                        policy_id=None,
-                        reasoning=reason,
-                        user_explanation=explanation,
-                    )
-                )
-                return _build_blocked_result(
-                    user_input=user_input,
-                    processed_input=user_input,
-                    role_id=role_id,
-                    query_type=query_type,
-                    authorized=False,
-                    input_scan_results=[],
-                    output_scan_results=[],
-                    violations=[],
-                    remediation_actions=remediation_actions,
-                    final_response=explanation or BLOCKED_AUTHORIZATION_MESSAGE,
-                    requires_escalation=False,
-                    near_misses=[],
-                )
-
-            input_scan_results = await _call_mcp_tool(
-                session,
-                "scan_input",
-                {"text": user_input, "policy_ids": []},
-            )
-            if not isinstance(input_scan_results, list):
-                input_scan_results = []
-
-            if _has_blocking_detection(input_scan_results):
-                violations = _violations_from_scans(input_scan_results)
-                blockers = [v for v in violations if v.get("action") == "block"]
-                policy_id = blockers[0].get("policy_id") if blockers else None
-                reasoning = (
-                    f"Autonomous remediation: input blocked because policy '{policy_id}' "
-                    "detected a violation with action=block."
-                )
-                explanation = await _explain_remediation(
-                    anthropic_client,
-                    phase="input",
-                    action="block",
-                    policy_id=policy_id,
-                    reasoning=reasoning,
-                    original_snippet=user_input,
-                )
-                remediation_actions.append(
-                    RemediationAction(
-                        phase="input",
-                        action="block",
-                        policy_id=policy_id,
-                        reasoning=reasoning,
-                        user_explanation=explanation,
-                    )
-                )
-                input_near_misses = _collect_near_misses(input_scan_results, "input")
-                return _build_blocked_result(
-                    user_input=user_input,
-                    processed_input=user_input,
-                    role_id=role_id,
-                    query_type=query_type,
-                    authorized=True,
-                    input_scan_results=input_scan_results,
-                    output_scan_results=[],
-                    violations=violations,
-                    remediation_actions=remediation_actions,
-                    final_response=explanation or BLOCKED_POLICY_MESSAGE,
-                    requires_escalation=False,
-                    near_misses=input_near_misses,
-                )
-
-            processed_input = _redact_text(user_input, input_scan_results)
-            requires_escalation = await _record_scan_remediations(
-                anthropic_client,
-                phase="input",
-                text=user_input,
-                scan_results=input_scan_results,
-                remediation_actions=remediation_actions,
-                requires_escalation=requires_escalation,
+            return await _process_interaction_with_session(
+                session, user_input, role_id, history
             )
 
-            llm_response = await _generate_llm_response(
-                anthropic_client,
-                processed_input,
-                history,
+
+class PolicyEngineMcp:
+    """
+    Long-lived MCP connection to server.py on a background asyncio loop.
+
+    Reuses one policy-engine subprocess across Streamlit messages. The server
+    reloads all config from disk on each tool call.
+    """
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._session: ClientSession | None = None
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._start_error: BaseException | None = None
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def is_running(self) -> bool:
+        return (
+            not self._closed
+            and self._ready.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+        )
+
+    def start(self) -> None:
+        """Start the background MCP subprocess and session."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("PolicyEngineMcp is closed")
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._thread_main,
+                name="policy-engine-mcp",
+                daemon=True,
             )
+            self._thread.start()
 
-            output_scan_results = await _call_mcp_tool(
-                session,
-                "scan_output",
-                {"text": llm_response, "policy_ids": []},
-            )
-            if not isinstance(output_scan_results, list):
-                output_scan_results = []
+        if not self._ready.wait(timeout=60):
+            raise TimeoutError("Policy engine MCP did not start within 60s")
+        if self._start_error is not None:
+            raise RuntimeError("Policy engine MCP failed to start") from self._start_error
 
-            violations = _violations_from_scans(input_scan_results) + _violations_from_scans(
-                output_scan_results
-            )
-            final_response = llm_response
-            was_blocked = False
+    def close(self) -> None:
+        """Shut down the MCP subprocess and background loop."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
 
-            if _has_blocking_detection(output_scan_results):
-                was_blocked = True
-                out_violations = _violations_from_scans(output_scan_results)
-                blockers = [v for v in out_violations if v.get("action") == "block"]
-                policy_id = blockers[0].get("policy_id") if blockers else None
-                reasoning = (
-                    f"Autonomous remediation: output blocked because policy '{policy_id}' "
-                    "detected a violation with action=block."
-                )
-                explanation = await _explain_remediation(
-                    anthropic_client,
-                    phase="output",
-                    action="block",
-                    policy_id=policy_id,
-                    reasoning=reasoning,
-                    original_snippet=llm_response,
-                )
-                remediation_actions.append(
-                    RemediationAction(
-                        phase="output",
-                        action="block",
-                        policy_id=policy_id,
-                        reasoning=reasoning,
-                        user_explanation=explanation,
-                    )
-                )
-                final_response = explanation or BLOCKED_OUTPUT_MESSAGE
-            else:
-                redacted_output = _redact_text(llm_response, output_scan_results)
-                if redacted_output != llm_response:
-                    final_response = redacted_output
-                requires_escalation = await _record_scan_remediations(
-                    anthropic_client,
-                    phase="output",
-                    text=llm_response,
-                    scan_results=output_scan_results,
-                    remediation_actions=remediation_actions,
-                    requires_escalation=requires_escalation,
-                )
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=15)
 
-            near_misses = _collect_near_misses(
-                input_scan_results, "input"
-            ) + _collect_near_misses(output_scan_results, "output")
+    def run_interaction(
+        self,
+        user_input: str,
+        role_id: str,
+        conversation_history: list[dict[str, Any]] | None = None,
+    ) -> InteractionResult:
+        """Run the governance pipeline on the persistent MCP session (sync API)."""
+        if not self.is_running:
+            raise RuntimeError("PolicyEngineMcp is not running; call start() first")
 
-            return InteractionResult(
-                original_input=user_input,
-                processed_input=processed_input,
-                role_id=role_id,
-                query_type=query_type,
-                authorized=authorized,
-                input_scan_results=input_scan_results,
-                output_scan_results=output_scan_results,
-                violations=violations,
-                remediation_actions=[a.to_dict() for a in remediation_actions],
-                final_response=final_response,
-                was_blocked=was_blocked,
-                requires_escalation=requires_escalation,
-                near_misses=near_misses,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            )
+        history = conversation_history or []
+        assert self._loop is not None and self._session is not None
+        coro = _process_interaction_with_session(
+            self._session, user_input, role_id, history
+        )
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=MCP_INTERACTION_TIMEOUT_SECONDS)
+        except Exception:
+            self.close()
+            raise
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            loop.run_until_complete(self._serve_until_stopped())
+        except BaseException as exc:
+            if not self._ready.is_set():
+                self._start_error = exc
+                self._ready.set()
+        finally:
+            loop.close()
+
+    async def _serve_until_stopped(self) -> None:
+        try:
+            async with stdio_client(_stdio_server_params()) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._ready.set()
+                    while not self._stop.is_set():
+                        await asyncio.sleep(0.2)
+        except BaseException as exc:
+            if not self._ready.is_set():
+                self._start_error = exc
+                self._ready.set()
+            raise

@@ -66,7 +66,7 @@ Reviewers can mark items True Positive / False Positive / Near Miss, add notes, 
 
 **Audit trail**
 
-Every interaction in a session is logged with timestamp, role, violations, blocks, and escalations. Export to CSV for offline review.
+Every interaction in a session is logged with timestamp, role, violations, blocks, and escalations. Sensitive fields are **redacted** in the UI and CSV export for demo safety. Export to CSV for offline review.
 
 **Policy versioning**
 
@@ -123,10 +123,38 @@ flowchart LR
 | Policy engine (MCP) | `server.py` | Loads policies/roles; exposes scan and classify tools over stdio |
 | Remediation agent | `agent.py` | Orchestrates MCP + Sonnet; applies block/redact/warn/escalate |
 | Web UI | `app.py` | Streamlit: chat, policy dashboard, audit trail, escalation queue |
+| Policy upload validation | `policy_validation.py` | JSON schema, ReDoS-safe regex checks, 1 MB upload cap |
+| Audit redaction | `redaction.py` | Redacts PII-like patterns in audit trail entries and exports |
 | Policies | `config/policies.json` | Detection rules, thresholds, actions |
 | Roles | `config/roles.json` | Permitted / restricted query types per role |
 
-The agent **spawns** `server.py` as a subprocess for each interaction (stdio MCP). Policy file changes on disk are picked up on the next subprocess start.
+**MCP connection model**
+
+| Context | Behavior |
+|---------|----------|
+| **Streamlit app** | One long-lived `server.py` subprocess per browser session (`PolicyEngineMcp` in `agent.py`). Later chat messages reuse the same process for lower latency. |
+| **Tests / CLI** | `process_interaction()` still spawns a one-shot MCP subprocess per call. |
+| **Cursor / MCP clients** | Connect directly to `server.py` over stdio (see below). |
+
+**Config reload:** On every MCP tool call, the policy engine reloads all files from `config/` (policies, roles, and any future config added to `_reload_config()`). Dashboard saves and uploads apply to the **next** scan without restarting the server. The `reload_config` tool forces a reload explicitly.
+
+### Scan performance
+
+The policy engine optimizes latency and API usage on each scan:
+
+- **Block policies first**, evaluated in parallel (up to 4 concurrent Haiku calls).
+- **Short-circuit:** If any block policy fires on input, non-block policies are skipped for that scan.
+- **Regex short-circuit:** For block policies, a regex match skips the Haiku call for that policy.
+
+These changes reduce Anthropic usage on blocked input; parallel scans mainly improve response time when many policies still run.
+
+### Security (demo scope)
+
+| Control | Implementation |
+|---------|----------------|
+| Policy upload validation | `policy_validation.py` — schema, pattern safety, size limit (aligned with `.streamlit/config.toml` `maxUploadSize = 1`) |
+| Audit redaction | `redaction.py` — masks emails, phones, SSNs, cards in stored/exported audit rows |
+| No production auth | Role selector is UI-only; not suitable for multi-tenant production without real identity |
 
 ### Requirements
 
@@ -201,10 +229,13 @@ The process waits on stdio; Ctrl+C exits with a normal `KeyboardInterrupt` trace
 
 ```bash
 # Unit tests only (no API key)
-pytest test_agent.py -m "not integration" -v
+pytest test_agent.py test_server_scan.py test_server_reload.py test_policy_validation.py test_redaction.py -m "not integration" -v
 
 # Full suite including live API + MCP
-pytest test_agent.py -v
+pytest -v
+
+# Smoke test: persistent MCP + config reload (requires API key)
+python scripts/test_persistent_mcp.py
 ```
 
 Integration tests are skipped automatically when `ANTHROPIC_API_KEY` is unset (`conftest.py`).
@@ -224,23 +255,34 @@ Integration tests are skipped automatically when `ANTHROPIC_API_KEY` is unset (`
 | **LLM variability** | Query classification and policy scoring use Haiku/Sonnet; results can vary slightly between runs |
 | **Near misses** | Require LLM scan confidence in the near-miss band; regex-only near misses are uncommon |
 | **Role enforcement** | Based on predicted query type, not manual user attestation |
-| **Policy updates** | Saved/uploaded policies apply to **new** MCP subprocesses; in-flight chats use policies loaded at scan time |
+| **Policy updates** | Reloaded from disk on each MCP tool call; very large policy sets may add small per-scan I/O cost |
 | **Output blocking** | A blocked output replaces the model answer with an explanation — no partial response |
 | **Scale** | Designed for demonstration and team pilots, not high-volume production without adding persistence, auth, and async job queues |
-| **Subprocess overhead** | Each chat message starts an MCP server process — adds latency vs embedded library calls |
+| **First message latency** | First chat in a session pays MCP subprocess startup (~1–2s locally); later messages reuse the session engine |
+| **Streamlit reruns** | First submit may trigger two Streamlit reruns; rare duplicate MCP startup on the first message only |
 
 ### Repository structure
 
 ```
 ai-governance-platform/
-├── app.py                 # Streamlit UI
-├── agent.py               # Remediation agent
-├── server.py              # MCP policy engine
+├── app.py                      # Streamlit UI
+├── agent.py                    # Remediation agent + PolicyEngineMcp
+├── server.py                   # MCP policy engine
+├── policy_validation.py        # Upload / save validation
+├── redaction.py                # Audit trail redaction
 ├── config/
 │   ├── policies.json
 │   └── roles.json
+├── scripts/
+│   └── test_persistent_mcp.py  # MCP session + reload smoke test
+├── test_fixtures/              # Invalid policy uploads for tests
 ├── test_agent.py
+├── test_server_scan.py
+├── test_server_reload.py
+├── test_policy_validation.py
+├── test_redaction.py
 ├── conftest.py
+├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── run_app.ps1

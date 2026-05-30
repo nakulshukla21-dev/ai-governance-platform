@@ -4,9 +4,11 @@ AI Governance Platform — MCP policy engine server (stdio transport).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,8 @@ from fastmcp import FastMCP
 
 CONFIG_DIR = Path(__file__).resolve().parent / "config"
 MODEL_ID = "claude-haiku-4-5-20251001"
+BLOCK_ACTION = "block"
+MAX_CONCURRENT_LLM_SCANS = 4
 
 mcp = FastMCP(
     "ai-governance-policy-engine",
@@ -30,9 +34,11 @@ _roles: dict[str, dict[str, Any]] = {}
 _policies_by_id: dict[str, dict[str, Any]] = {}
 _all_query_types: list[str] = []
 _anthropic_client: anthropic.Anthropic | None = None
+_async_anthropic_client: anthropic.AsyncAnthropic | None = None
 
 
 def _load_config() -> None:
+    """Read all config files from CONFIG_DIR into process memory."""
     global _policies, _roles, _policies_by_id, _all_query_types
 
     with open(CONFIG_DIR / "policies.json", encoding="utf-8") as f:
@@ -51,6 +57,11 @@ def _load_config() -> None:
     _all_query_types = sorted(query_type_set)
 
 
+def _reload_config() -> None:
+    """Reload every config file from disk (policies, roles, and future additions)."""
+    _load_config()
+
+
 def _get_client() -> anthropic.Anthropic:
     global _anthropic_client
     if _anthropic_client is None:
@@ -59,6 +70,16 @@ def _get_client() -> anthropic.Anthropic:
             raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
         _anthropic_client = anthropic.Anthropic(api_key=api_key)
     return _anthropic_client
+
+
+def _get_async_client() -> anthropic.AsyncAnthropic:
+    global _async_anthropic_client
+    if _async_anthropic_client is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+        _async_anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+    return _async_anthropic_client
 
 
 def _parse_llm_json(text: str) -> dict[str, Any]:
@@ -108,6 +129,34 @@ def _call_haiku(instructions: str, content: str) -> dict[str, Any]:
     return _parse_llm_json(raw)
 
 
+async def _call_haiku_async(instructions: str, content: str) -> dict[str, Any]:
+    client = _get_async_client()
+    response = await client.messages.create(
+        model=MODEL_ID,
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "<instructions>\n"
+                    f"{instructions}\n"
+                    "Respond with a single valid JSON object only. "
+                    "Do not include markdown fences or commentary.\n"
+                    "</instructions>\n\n"
+                    "<content_to_evaluate>\n"
+                    f"{content}\n"
+                    "</content_to_evaluate>"
+                ),
+            }
+        ],
+    )
+    raw = ""
+    for block in response.content:
+        if block.type == "text":
+            raw += block.text
+    return _parse_llm_json(raw)
+
+
 def _run_regex_scan(text: str, patterns: list[str]) -> dict[str, Any]:
     matches: list[str] = []
     for pattern in patterns:
@@ -126,9 +175,9 @@ def _run_regex_scan(text: str, patterns: list[str]) -> dict[str, Any]:
     }
 
 
-def _run_llm_scan(policy: dict[str, Any], text: str) -> dict[str, Any]:
+async def _run_llm_scan_async(policy: dict[str, Any], text: str) -> dict[str, Any]:
     instructions = _policy_instructions(policy.get("llm_prompt", ""))
-    return _call_haiku(instructions, text)
+    return await _call_haiku_async(instructions, text)
 
 
 def _threshold_for_policy(policy: dict[str, Any], scope: str) -> float:
@@ -154,10 +203,44 @@ def _llm_detected(llm_payload: dict[str, Any] | None) -> bool:
     return bool(llm_payload.get("detected", False))
 
 
-def _evaluate_policy(
+def _skip_llm_after_regex_block(
+    policy: dict[str, Any], regex_result: dict[str, Any]
+) -> bool:
+    """Skip Haiku when regex already matched on a block-action policy."""
+    return (
+        policy.get("action") == BLOCK_ACTION
+        and bool(regex_result.get("matched"))
+    )
+
+
+def _is_blocking_result(result: dict[str, Any]) -> bool:
+    return bool(result.get("detected")) and result.get("action") == BLOCK_ACTION
+
+
+def _policy_scan_groups(
+    policies: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    block_policies = [p for p in policies if p.get("action") == BLOCK_ACTION]
+    other_policies = [p for p in policies if p.get("action") != BLOCK_ACTION]
+    return block_policies, other_policies
+
+
+def _error_result(policy: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    return {
+        "policy_id": policy["id"],
+        "detected": False,
+        "confidence": 0.0,
+        "action": policy.get("action"),
+        "severity": policy.get("severity"),
+        "detail": {"error": str(exc)},
+    }
+
+
+async def _evaluate_policy_async(
     policy: dict[str, Any],
     text: str,
     scope: str,
+    llm_semaphore: asyncio.Semaphore,
 ) -> dict[str, Any]:
     method = policy.get("detection_method", "llm")
     threshold = _threshold_for_policy(policy, scope)
@@ -171,23 +254,30 @@ def _evaluate_policy(
         detail["regex"] = regex_result
         regex_confidence = float(regex_result.get("confidence", 0.0))
 
-    if method in ("llm", "ensemble"):
-        llm_payload = _run_llm_scan(policy, text)
+    run_llm = method in ("llm", "ensemble")
+    if run_llm and method == "ensemble" and "regex" in detail:
+        run_llm = not _skip_llm_after_regex_block(policy, detail["regex"])
+
+    if run_llm:
+        async with llm_semaphore:
+            llm_payload = await _run_llm_scan_async(policy, text)
         detail["llm"] = llm_payload
         violation_confidence = _llm_violation_confidence(llm_payload)
+    elif method in ("llm", "ensemble"):
+        detail["llm_skipped"] = "regex_block_short_circuit"
 
     if method == "regex":
         confidence = regex_confidence
         detected = confidence >= threshold
     elif method == "llm":
         confidence = violation_confidence
-        llm_detected = _llm_detected(llm_payload)
-        detected = llm_detected and violation_confidence >= threshold
+        llm_hit = _llm_detected(llm_payload)
+        detected = llm_hit and violation_confidence >= threshold
     else:
         regex_hit = detail.get("regex", {}).get("matched", False)
-        llm_detected = _llm_detected(llm_payload)
+        llm_hit = _llm_detected(llm_payload)
         confidence = violation_confidence
-        detected = regex_hit or (llm_detected and violation_confidence >= threshold)
+        detected = regex_hit or (llm_hit and violation_confidence >= threshold)
 
     return {
         "policy_id": policy["id"],
@@ -199,12 +289,30 @@ def _evaluate_policy(
     }
 
 
-def _scan_scope(
+async def _evaluate_policies_parallel(
+    policies: list[dict[str, Any]],
+    text: str,
+    scope: str,
+) -> list[dict[str, Any]]:
+    if not policies:
+        return []
+
+    llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_SCANS)
+
+    async def run_one(policy: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await _evaluate_policy_async(policy, text, scope, llm_semaphore)
+        except Exception as exc:
+            return _error_result(policy, exc)
+
+    return list(await asyncio.gather(*(run_one(policy) for policy in policies)))
+
+
+async def _scan_scope_async(
     text: str,
     policy_ids: list[str],
     scope: str,
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
     candidates = [
         p
         for p in _policies
@@ -213,21 +321,36 @@ def _scan_scope(
         and (not policy_ids or p["id"] in policy_ids)
     ]
 
-    for policy in candidates:
-        try:
-            results.append(_evaluate_policy(policy, text, scope))
-        except Exception as exc:
-            results.append(
-                {
-                    "policy_id": policy["id"],
-                    "detected": False,
-                    "confidence": 0.0,
-                    "action": policy.get("action"),
-                    "severity": policy.get("severity"),
-                    "detail": {"error": str(exc)},
-                }
-            )
-    return results
+    block_policies, other_policies = _policy_scan_groups(candidates)
+
+    block_results = await _evaluate_policies_parallel(block_policies, text, scope)
+    if any(_is_blocking_result(result) for result in block_results):
+        return block_results
+
+    if not other_policies:
+        return block_results
+
+    other_results = await _evaluate_policies_parallel(other_policies, text, scope)
+    return block_results + other_results
+
+
+def _run_async(coro: Any) -> Any:
+    """Run async scan logic from sync MCP tool handlers."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result()
+
+
+def _scan_scope(
+    text: str,
+    policy_ids: list[str],
+    scope: str,
+) -> list[dict[str, Any]]:
+    return _run_async(_scan_scope_async(text, policy_ids, scope))
 
 
 def _classify_query_type(text: str) -> dict[str, Any]:
@@ -261,14 +384,28 @@ _load_config()
 
 
 @mcp.tool
+def reload_config() -> dict[str, Any]:
+    """Reload all configuration from disk without restarting the policy engine."""
+    _reload_config()
+    return {
+        "reloaded": True,
+        "policy_count": len(_policies),
+        "role_count": len(_roles),
+        "config_dir": str(CONFIG_DIR),
+    }
+
+
+@mcp.tool
 def get_active_policies() -> list[dict[str, Any]]:
     """Return all enabled policies with their full configuration."""
+    _reload_config()
     return [dict(p) for p in _policies if p.get("enabled")]
 
 
 @mcp.tool
 def get_role(role_id: str) -> dict[str, Any]:
     """Return a role definition including permitted and restricted query types."""
+    _reload_config()
     role = _roles.get(role_id)
     if role is None:
         return {"error": f"Role '{role_id}' not found", "available_roles": list(_roles.keys())}
@@ -279,8 +416,9 @@ def get_role(role_id: str) -> dict[str, Any]:
 def scan_input(text: str, policy_ids: list[str] | None = None) -> list[dict[str, Any]]:
     """
     Run enabled input-scoped policies against the text.
-    Regex runs first for regex/ensemble policies, then Claude Haiku for LLM scoring.
+    Block policies run first in parallel; remaining policies are skipped if input is blocked.
     """
+    _reload_config()
     ids = policy_ids or []
     return _scan_scope(text, ids, "input")
 
@@ -289,8 +427,9 @@ def scan_input(text: str, policy_ids: list[str] | None = None) -> list[dict[str,
 def scan_output(text: str, policy_ids: list[str] | None = None) -> list[dict[str, Any]]:
     """
     Run enabled output-scoped policies against the text.
-    Regex runs first for regex/ensemble policies, then Claude Haiku for LLM scoring.
+    Block policies run first in parallel; scans use parallel Haiku calls with a concurrency cap.
     """
+    _reload_config()
     ids = policy_ids or []
     return _scan_scope(text, ids, "output")
 
@@ -300,6 +439,7 @@ def classify_query(text: str, role_id: str) -> dict[str, Any]:
     """
     Classify the query type with Claude Haiku and check whether the role may run it.
     """
+    _reload_config()
     role = _roles.get(role_id)
     if role is None:
         return {

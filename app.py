@@ -10,17 +10,23 @@ import io
 import json
 import os
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Any
 
-import anyio
 import streamlit as st
 from dotenv import load_dotenv
 
-from agent import InteractionResult, process_interaction
+from agent import InteractionResult, PolicyEngineMcp
+from policy_validation import (
+    MAX_UPLOAD_BYTES,
+    validate_policies_doc,
+    validate_upload_size,
+)
+from redaction import redact_interaction_entry
 
 load_dotenv()
+
+MAX_AUDIT_TRAIL_ENTRIES = 50
 
 ROOT_DIR = Path(__file__).resolve().parent
 POLICIES_PATH = ROOT_DIR / "config" / "policies.json"
@@ -51,6 +57,23 @@ def save_policies_doc(doc: dict[str, Any]) -> None:
         f.write("\n")
 
 
+def _show_validation_errors(errors: list[str]) -> None:
+    st.error("Policy validation failed. Changes were not saved.")
+    for message in errors[:15]:
+        st.markdown(f"- {message}")
+    if len(errors) > 15:
+        st.caption(f"…and {len(errors) - 15} more issue(s).")
+
+
+def append_audit_entry(result: InteractionResult) -> None:
+    redacted = redact_interaction_entry(result.to_dict())
+    st.session_state.audit_trail.append(redacted)
+    if len(st.session_state.audit_trail) > MAX_AUDIT_TRAIL_ENTRIES:
+        st.session_state.audit_trail = st.session_state.audit_trail[
+            -MAX_AUDIT_TRAIL_ENTRIES:
+        ]
+
+
 def record_policy_version(doc: dict[str, Any], change_type: str) -> None:
     versions: list[dict[str, Any]] = st.session_state.policy_versions
     versions.append(
@@ -63,10 +86,23 @@ def record_policy_version(doc: dict[str, Any], change_type: str) -> None:
     )
 
 
+def clear_policy_dashboard_widget_state() -> None:
+    """Reset toggle widget keys so the UI reflects policies_doc after restore/upload."""
+    for key in list(st.session_state.keys()):
+        if key.startswith("policy_enabled_"):
+            del st.session_state[key]
+    st.session_state.policy_ui_epoch = st.session_state.get("policy_ui_epoch", 0) + 1
+
+
+def refresh_policy_dashboard_from_disk() -> None:
+    st.session_state.policies_doc = load_policies_doc()
+    clear_policy_dashboard_widget_state()
+
+
 def restore_policy_version(version_entry: dict[str, Any]) -> None:
     snapshot = copy.deepcopy(version_entry["snapshot"])
     save_policies_doc(snapshot)
-    st.session_state.policies_doc = load_policies_doc()
+    refresh_policy_dashboard_from_disk()
     record_policy_version(st.session_state.policies_doc, "restored")
 
 
@@ -84,6 +120,8 @@ def init_session_state() -> None:
         st.session_state.selected_role_label = "Analyst"
     if "escalation_selected_row_key" not in st.session_state:
         st.session_state.escalation_selected_row_key = None
+    if "policy_ui_epoch" not in st.session_state:
+        st.session_state.policy_ui_epoch = 0
 
 
 def format_thresholds(policy: dict[str, Any]) -> str:
@@ -101,19 +139,36 @@ def severity_badge(severity: str | None) -> str:
     return f'<span style="{style}">{label}</span>'
 
 
+def get_policy_engine() -> PolicyEngineMcp:
+    """Reuse one MCP policy-engine subprocess for the Streamlit session."""
+    engine = st.session_state.get("policy_engine")
+    if engine is None or not engine.is_running:
+        if engine is not None:
+            engine.close()
+        engine = PolicyEngineMcp()
+        engine.start()
+        st.session_state.policy_engine = engine
+    return engine
+
+
+def close_policy_engine() -> None:
+    engine = st.session_state.pop("policy_engine", None)
+    if engine is not None:
+        engine.close()
+
+
 def run_interaction(
     user_input: str,
     role_id: str,
     conversation_history: list[dict[str, Any]],
 ) -> InteractionResult:
-    return anyio.run(
-        partial(
-            process_interaction,
-            user_input,
-            role_id,
-            conversation_history,
+    try:
+        return get_policy_engine().run_interaction(
+            user_input, role_id, conversation_history
         )
-    )
+    except Exception:
+        close_policy_engine()
+        raise
 
 
 def policies_scanned(result: InteractionResult) -> list[str]:
@@ -201,12 +256,13 @@ def render_policy_dashboard() -> None:
     doc = st.session_state.policies_doc
     policies: list[dict[str, Any]] = doc.get("policies", [])
 
+    ui_epoch = st.session_state.policy_ui_epoch
     for index, policy in enumerate(policies):
         policy_id = policy.get("id", f"policy-{index}")
         enabled = st.toggle(
             f"Enable {policy.get('name', policy_id)}",
             value=bool(policy.get("enabled", True)),
-            key=f"policy_enabled_{policy_id}",
+            key=f"policy_enabled_{ui_epoch}_{policy_id}",
         )
         policy["enabled"] = enabled
 
@@ -222,10 +278,14 @@ def render_policy_dashboard() -> None:
         st.divider()
 
     if st.button("Save policy changes", use_container_width=True):
-        save_policies_doc(doc)
-        st.session_state.policies_doc = load_policies_doc()
-        record_policy_version(st.session_state.policies_doc, "manual edit")
-        st.success("Policies saved to config/policies.json")
+        errors = validate_policies_doc(doc)
+        if errors:
+            _show_validation_errors(errors)
+        else:
+            save_policies_doc(doc)
+            refresh_policy_dashboard_from_disk()
+            record_policy_version(st.session_state.policies_doc, "manual edit")
+            st.success("Policies saved to config/policies.json")
 
     with st.expander("Policy Version History", expanded=False):
         versions = list(reversed(st.session_state.policy_versions))
@@ -249,23 +309,39 @@ def render_policy_dashboard() -> None:
                     st.rerun()
 
     uploaded = st.file_uploader(
-        "Upload custom policies.json",
+        f"Upload custom policies.json (max {MAX_UPLOAD_BYTES // 1000} KB)",
         type=["json"],
-        help="Replaces the active policy set in config/policies.json",
+        help="Select a file, then click Apply. Validated before replacing active policies.",
     )
     if uploaded is not None:
+        st.caption(f"Selected: **{uploaded.name}** ({len(uploaded.getvalue()) // 1000} KB)")
+
+    if uploaded is not None and st.button(
+        "Apply uploaded policies",
+        use_container_width=True,
+        key="apply_policy_upload",
+    ):
+        raw = uploaded.getvalue()
+        size_error = validate_upload_size(raw)
+        if size_error:
+            st.error(size_error)
+            return
         try:
-            new_doc = json.loads(uploaded.getvalue().decode("utf-8"))
-            if "policies" not in new_doc or not isinstance(new_doc["policies"], list):
-                st.error("Invalid policies.json: missing 'policies' array.")
-            else:
-                save_policies_doc(new_doc)
-                st.session_state.policies_doc = load_policies_doc()
-                record_policy_version(st.session_state.policies_doc, "upload")
-                st.success("Uploaded policies applied.")
-                st.rerun()
+            new_doc = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
             st.error(f"Invalid JSON: {exc}")
+            return
+
+        errors = validate_policies_doc(new_doc)
+        if errors:
+            _show_validation_errors(errors)
+            return
+
+        save_policies_doc(new_doc)
+        refresh_policy_dashboard_from_disk()
+        record_policy_version(st.session_state.policies_doc, "upload")
+        st.success("Uploaded policies applied.")
+        st.rerun()
 
 
 def render_chat_tab(role_id: str) -> None:
@@ -296,7 +372,7 @@ def render_chat_tab(role_id: str) -> None:
                 "result": result,
             }
         )
-        st.session_state.audit_trail.append(result.to_dict())
+        append_audit_entry(result)
         st.rerun()
 
 
@@ -410,13 +486,20 @@ def apply_threshold_adjustment(
             thresholds = policy.setdefault("thresholds", {})
             thresholds[scope] = round(new_threshold, 4)
             break
+    errors = validate_policies_doc(doc)
+    if errors:
+        _show_validation_errors(errors)
+        return
     save_policies_doc(doc)
-    st.session_state.policies_doc = load_policies_doc()
+    refresh_policy_dashboard_from_disk()
     record_policy_version(st.session_state.policies_doc, "manual edit")
 
 
 def render_audit_trail_tab() -> None:
     st.subheader("Session Audit Trail")
+    st.caption(
+        "Audit entries are redacted for demo safety. Exports do not include raw PII."
+    )
 
     if not st.session_state.audit_trail:
         st.info("No interactions yet. Send a message in the Chat tab.")
@@ -442,7 +525,7 @@ def render_audit_trail_tab() -> None:
         writer.writeheader()
         writer.writerows(rows)
     st.download_button(
-        label="Export audit trail as CSV",
+        label="Export redacted audit trail as CSV",
         data=buffer.getvalue(),
         file_name="audit_trail.csv",
         mime="text/csv",

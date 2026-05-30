@@ -3,3 +3,5 @@
 
 [server]
 port = 8503
+# Match policy_validation.MAX_UPLOAD_BYTES (1_000_000 bytes ≈ 1 MB).
+maxUploadSize = 1

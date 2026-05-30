@@ -1,0 +1,50 @@
+{
+  "version": "1.0.0",
+  "description": "Intentionally invalid policy set for testing upload validation.",
+  "policies": [
+    {
+      "id": "bad-regex-redos",
+      "name": "ReDoS pattern",
+      "description": "Should fail regex safety check (nested quantifiers).",
+      "enabled": true,
+      "scope": ["input"],
+      "action": "block",
+      "severity": "critical",
+      "detection_method": "regex",
+      "thresholds": {
+        "input": 0.9
+      },
+      "patterns": [
+        "(a+)+"
+      ],
+      "llm_prompt": ""
+    },
+    {
+      "id": "bad-regex-redos",
+      "name": "Duplicate ID",
+      "description": "Duplicate policy id should also be rejected.",
+      "enabled": true,
+      "scope": ["output"],
+      "action": "invalid_action",
+      "severity": "extreme",
+      "detection_method": "magic",
+      "thresholds": {
+        "output": 1.5
+      },
+      "patterns": [],
+      "llm_prompt": ""
+    },
+    {
+      "id": "missing-thresholds",
+      "name": "LLM without thresholds",
+      "enabled": true,
+      "scope": ["input"],
+      "action": "warn",
+      "severity": "low",
+      "detection_method": "llm",
+      "thresholds": {},
+      "patterns": [],
+      "llm_prompt": "Score this text."
+    }
+  ]
+}
