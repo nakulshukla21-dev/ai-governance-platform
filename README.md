@@ -247,6 +247,6 @@ ai-governance-platform/
 └── .streamlit/config.toml
 ```
 
-### License
+## Author
 
-Add your organization’s license terms here if open-sourcing or distributing internally.
+**Nakul Shukla** — SVP Product Manager, AI/ML & RegTech | [LinkedIn](https://www.linkedin.com/in/nakul-shukla-62961853/)
