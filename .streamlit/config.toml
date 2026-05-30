@@ -1,7 +1,6 @@
-# Local development: use 8503 (8501 = AML knowledge base, 8502 = other app).
-# Streamlit Community Cloud ignores server.port and always serves on 8501.
+# Do not set server.port here — Streamlit Cloud health-checks localhost:8501.
+# For local dev on 8503: .\run_app.ps1  or  streamlit run app.py --server.port 8503
 
 [server]
-port = 8503
 # Match policy_validation.MAX_UPLOAD_BYTES (1_000_000 bytes ≈ 1 MB).
 maxUploadSize = 1

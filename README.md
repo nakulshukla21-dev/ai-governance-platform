@@ -183,12 +183,14 @@ cp .env.example .env
 
 ### Run the Streamlit app (local)
 
-Default local port is **8503** (see `.streamlit/config.toml`) to avoid clashing with other apps on 8501/8502.
+**Streamlit Community Cloud** always health-checks **8501** — do not set `server.port` in `.streamlit/config.toml` (use `run_app.ps1` for a custom local port only).
+
+Local default port **8503** avoids clashing with other apps on 8501/8502:
 
 ```bash
-streamlit run app.py
-# or
 .\run_app.ps1
+# or
+streamlit run app.py --server.port 8503
 ```
 
 Override port:
@@ -197,7 +199,7 @@ Override port:
 streamlit run app.py --server.port 8504
 ```
 
-**Streamlit Community Cloud** ignores `server.port` in config and serves on **8501**. Set `ANTHROPIC_API_KEY` in app secrets. Use `requirements.txt` as the packages file.
+On Cloud, set `ANTHROPIC_API_KEY` in app secrets. Use `requirements.txt` as the packages file.
 
 ### Run the MCP server standalone (optional)
 
