@@ -72,6 +72,28 @@ Every interaction in a session is logged with timestamp, role, violations, block
 
 Policy changes (manual save or file upload) are snapshotted in the UI. Previous versions can be **restored** with a full history of what changed and when.
 
+**Policy Synthesis** (Phase 1)
+
+Turn regulatory and internal policy documents into **candidate enforcement rules** for `config/policies.json`:
+
+1. Upload internal **PDFs** and/or select **pre-approved regulatory sources** (fetch logic aligned with [AI Governance Navigator](https://bit.ly/ai-governance-navigator))
+2. **Extract Obligations** — Claude Sonnet proposes distinct, reviewable rules
+3. Edit fields per rule, confirm the approval checkbox, **Mark as approved**
+4. **Commit all approved rules** — schema validation, timestamped file backup, version history, policy engine reload
+
+**Allowlisted regulatory sources**
+
+| Source | Jurisdiction / body |
+|--------|---------------------|
+| EU AI Act | European Union |
+| NIST AI RMF | United States |
+| MAS AI Guidance | Singapore |
+| UK AI Policy | United Kingdom |
+| FATF AI Guidance | Financial crime / AML |
+| India (NITI Aayog + DPDPA) | India |
+
+No free-text URLs in Phase 1. Low-confidence candidates commit with `enabled: false`. Merge-into-existing policy is not available yet (overlap warnings only).
+
 ### How it works (high level)
 
 ```mermaid
@@ -112,6 +134,28 @@ flowchart LR
 4. **Scan output** and apply the same remediation rules.  
 5. **Record** the result for audit and escalation review.
 
+**Policy Synthesis flow (Phase 1)**
+
+```mermaid
+flowchart LR
+    PDF[Internal PDFs]
+    REG[Allowlisted regulators]
+    ING[regulatory_ingest.py]
+    SYN[synthesizer.py Sonnet]
+    REV[Review and approve in UI]
+    VAL[policy_validation.py]
+    POL[policies.json]
+    MCP[Policy engine reload]
+
+    PDF --> ING
+    REG --> ING
+    ING --> SYN
+    SYN --> REV
+    REV --> VAL
+    VAL --> POL
+    POL --> MCP
+```
+
 ---
 
 ## Part 2 — Technical documentation
@@ -122,8 +166,11 @@ flowchart LR
 |-----------|------|------|
 | Policy engine (MCP) | `server.py` | Loads policies/roles; exposes scan and classify tools over stdio |
 | Remediation agent | `agent.py` | Orchestrates MCP + Sonnet; applies block/redact/warn/escalate |
-| Web UI | `app.py` | Streamlit: chat, policy dashboard, audit trail, escalation queue |
+| Web UI | `app.py` | Streamlit: chat, audit, escalation queue, policy synthesis |
+| Policy Synthesis UI | `policy_synthesis_ui.py` | Regulatory ingest + review/commit workflow |
 | Policy upload validation | `policy_validation.py` | JSON schema, ReDoS-safe regex checks, 1 MB upload cap |
+| Regulatory ingest | `regulatory_ingest.py` | Allowlisted source fetch (from Navigator ingest logic) |
+| Policy synthesis | `synthesizer.py` | Obligation extraction → candidate rules |
 | Audit redaction | `redaction.py` | Redacts PII-like patterns in audit trail entries and exports |
 | Policies | `config/policies.json` | Detection rules, thresholds, actions |
 | Roles | `config/roles.json` | Permitted / restricted query types per role |
@@ -152,7 +199,9 @@ These changes reduce Anthropic usage on blocked input; parallel scans mainly imp
 
 | Control | Implementation |
 |---------|----------------|
-| Policy upload validation | `policy_validation.py` — schema, pattern safety, size limit (aligned with `.streamlit/config.toml` `maxUploadSize = 1`) |
+| Policy upload validation | `policy_validation.py` — schema, pattern safety; JSON uploads capped at 1 MB in code |
+| Regulatory fetch | `regulatory_ingest.py` — allowlisted HTTPS only; no user-supplied URLs |
+| Synthesis output | Human approval required before write; candidates are not legal advice |
 | Audit redaction | `redaction.py` — masks emails, phones, SSNs, cards in stored/exported audit rows |
 | No production auth | Role selector is UI-only; not suitable for multi-tenant production without real identity |
 
@@ -199,7 +248,9 @@ Override port:
 streamlit run app.py --server.port 8504
 ```
 
-On Cloud, set `ANTHROPIC_API_KEY` in app secrets. Use `requirements.txt` as the packages file.
+On Cloud, set `ANTHROPIC_API_KEY` in app secrets. Use `requirements.txt` as the packages file. Outbound HTTPS is required for regulatory source fetch and Anthropic APIs.
+
+**Upload limits:** `.streamlit/config.toml` sets `maxUploadSize = 10` (MB) for PDF synthesis; `policies.json` replacements are still validated at 1 MB in application code.
 
 ### Run the MCP server standalone (optional)
 
@@ -231,7 +282,7 @@ The process waits on stdio; Ctrl+C exits with a normal `KeyboardInterrupt` trace
 
 ```bash
 # Unit tests only (no API key)
-pytest test_agent.py test_server_scan.py test_server_reload.py test_policy_validation.py test_redaction.py -m "not integration" -v
+pytest test_agent.py test_synthesizer.py test_regulatory_ingest.py test_server_scan.py test_server_reload.py test_policy_validation.py test_redaction.py -m "not integration" -v
 
 # Full suite including live API + MCP
 pytest -v
@@ -262,6 +313,8 @@ Integration tests are skipped automatically when `ANTHROPIC_API_KEY` is unset (`
 | **Scale** | Designed for demonstration and team pilots, not high-volume production without adding persistence, auth, and async job queues |
 | **First message latency** | First chat in a session pays MCP subprocess startup (~1–2s locally); later messages reuse the session engine |
 | **Streamlit reruns** | First submit may trigger two Streamlit reruns; rare duplicate MCP startup on the first message only |
+| **Policy Synthesis** | Sonnet extraction can vary; large corpora are truncated; Cloud filesystem backups are session-local |
+| **Sister project** | Navigator answers research questions; this platform **enforces** rules in chat — shared ingest, different goals |
 
 ### Repository structure
 
@@ -271,6 +324,9 @@ ai-governance-platform/
 ├── agent.py                    # Remediation agent + PolicyEngineMcp
 ├── server.py                   # MCP policy engine
 ├── policy_validation.py        # Upload / save validation
+├── regulatory_ingest.py        # Regulatory PDF/HTML fetch (Navigator-aligned)
+├── synthesizer.py              # Obligation → candidate rules (Sonnet)
+├── policy_synthesis_ui.py      # Policy Synthesis tab UI
 ├── redaction.py                # Audit trail redaction
 ├── config/
 │   ├── policies.json
@@ -282,6 +338,8 @@ ai-governance-platform/
 ├── test_server_scan.py
 ├── test_server_reload.py
 ├── test_policy_validation.py
+├── test_regulatory_ingest.py
+├── test_synthesizer.py
 ├── test_redaction.py
 ├── conftest.py
 ├── pytest.ini

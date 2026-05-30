@@ -17,6 +17,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent import InteractionResult, PolicyEngineMcp
+from policy_synthesis_ui import render_policy_synthesis_tab
 from policy_validation import (
     MAX_UPLOAD_BYTES,
     validate_policies_doc,
@@ -699,8 +700,8 @@ def main() -> None:
         st.caption(f"Role ID: `{role_id}`")
         render_policy_dashboard()
 
-    tab_chat, tab_audit, tab_escalation = st.tabs(
-        ["Chat", "Audit Trail", "Escalation Queue"]
+    tab_chat, tab_audit, tab_escalation, tab_synthesis = st.tabs(
+        ["Chat", "Audit Trail", "Escalation Queue", "Policy Synthesis"]
     )
 
     with tab_chat:
@@ -711,6 +712,16 @@ def main() -> None:
 
     with tab_escalation:
         render_escalation_queue_tab()
+
+    with tab_synthesis:
+        render_policy_synthesis_tab(
+            load_policies_doc=load_policies_doc,
+            save_policies_doc=save_policies_doc,
+            refresh_policy_dashboard=refresh_policy_dashboard_from_disk,
+            record_policy_version=record_policy_version,
+            close_policy_engine=close_policy_engine,
+            show_validation_errors=_show_validation_errors,
+        )
 
 
 if __name__ == "__main__":

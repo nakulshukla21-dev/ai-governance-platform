@@ -9,3 +9,6 @@ fastmcp>=2.0.0
 streamlit>=1.28.0
 anyio>=4.0.0
 jsonschema>=4.20.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+pypdf>=4.0.0

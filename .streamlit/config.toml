@@ -2,5 +2,5 @@
 # For local dev on 8503: .\run_app.ps1  or  streamlit run app.py --server.port 8503
 
 [server]
-# Match policy_validation.MAX_UPLOAD_BYTES (1_000_000 bytes ≈ 1 MB).
-maxUploadSize = 1
+# policies.json uploads validated at 1 MB in code; PDF synthesis allows up to 2 MB/file in app.
+maxUploadSize = 10

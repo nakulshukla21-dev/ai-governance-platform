@@ -44,6 +44,7 @@ desktop.ini
 # Logs and local artifacts
 *.log
 .cache/
+config/policies_backup_*.json
 
 # Cursor (local IDE state)
 .cursor/
