@@ -33,6 +33,7 @@ SERVER_SCRIPT = ROOT_DIR / "server.py"
 SONNET_MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 REDACTED_PLACEHOLDER = "[REDACTED]"
+NEAR_MISS_MARGIN = 0.10
 
 BLOCKED_AUTHORIZATION_MESSAGE = (
     "Your request cannot be processed because your role is not authorized "
@@ -88,6 +89,7 @@ class InteractionResult:
     was_blocked: bool
     requires_escalation: bool
     timestamp: str
+    near_misses: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -240,6 +242,43 @@ def _collect_warnings(scan_results: list[dict[str, Any]]) -> list[dict[str, Any]
         for r in _detected_results(scan_results)
         if r.get("action") == "warn"
     ]
+
+
+def _violation_confidence_from_scan(scan_result: dict[str, Any]) -> float:
+    confidence = float(scan_result.get("confidence", 0.0))
+    detail = scan_result.get("detail") or {}
+    llm_detail = detail.get("llm") or {}
+    if llm_detail.get("violation_confidence") is not None:
+        confidence = max(confidence, float(llm_detail["violation_confidence"]))
+    return confidence
+
+
+def _collect_near_misses(
+    scan_results: list[dict[str, Any]],
+    scope: str,
+) -> list[dict[str, Any]]:
+    """Flag non-detected scans within 10% below threshold for the scope."""
+    near_misses: list[dict[str, Any]] = []
+    for result in scan_results:
+        if result.get("detected"):
+            continue
+        detail = result.get("detail") or {}
+        threshold = float(detail.get("threshold", 0.0))
+        if threshold <= 0:
+            continue
+        confidence = _violation_confidence_from_scan(result)
+        lower_bound = threshold * (1.0 - NEAR_MISS_MARGIN)
+        if lower_bound <= confidence < threshold:
+            near_misses.append(
+                {
+                    "policy_id": result.get("policy_id"),
+                    "scope": scope,
+                    "violation_confidence": round(confidence, 4),
+                    "threshold": round(threshold, 4),
+                    "gap": round(threshold - confidence, 4),
+                }
+            )
+    return near_misses
 
 
 async def _explain_remediation(
@@ -396,6 +435,7 @@ def _build_blocked_result(
     remediation_actions: list[RemediationAction],
     final_response: str,
     requires_escalation: bool,
+    near_misses: list[dict[str, Any]] | None = None,
 ) -> InteractionResult:
     return InteractionResult(
         original_input=user_input,
@@ -410,6 +450,7 @@ def _build_blocked_result(
         final_response=final_response,
         was_blocked=True,
         requires_escalation=requires_escalation,
+        near_misses=near_misses or [],
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -489,6 +530,7 @@ async def process_interaction(
                     remediation_actions=remediation_actions,
                     final_response=explanation or BLOCKED_AUTHORIZATION_MESSAGE,
                     requires_escalation=False,
+                    near_misses=[],
                 )
 
             input_scan_results = await _call_mcp_tool(
@@ -524,6 +566,7 @@ async def process_interaction(
                         user_explanation=explanation,
                     )
                 )
+                input_near_misses = _collect_near_misses(input_scan_results, "input")
                 return _build_blocked_result(
                     user_input=user_input,
                     processed_input=user_input,
@@ -536,6 +579,7 @@ async def process_interaction(
                     remediation_actions=remediation_actions,
                     final_response=explanation or BLOCKED_POLICY_MESSAGE,
                     requires_escalation=False,
+                    near_misses=input_near_misses,
                 )
 
             processed_input = _redact_text(user_input, input_scan_results)
@@ -608,6 +652,10 @@ async def process_interaction(
                     requires_escalation=requires_escalation,
                 )
 
+            near_misses = _collect_near_misses(
+                input_scan_results, "input"
+            ) + _collect_near_misses(output_scan_results, "output")
+
             return InteractionResult(
                 original_input=user_input,
                 processed_input=processed_input,
@@ -621,5 +669,6 @@ async def process_interaction(
                 final_response=final_response,
                 was_blocked=was_blocked,
                 requires_escalation=requires_escalation,
+                near_misses=near_misses,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )

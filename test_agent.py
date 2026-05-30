@@ -117,6 +117,42 @@ def test_collect_warnings() -> None:
     assert warnings[0]["action"] == "warn"
 
 
+def test_collect_near_misses_within_margin() -> None:
+    scan_results = [
+        {
+            "policy_id": "pii-detection",
+            "detected": False,
+            "confidence": 0.77,
+            "detail": {"threshold": 0.85, "llm": {"violation_confidence": 0.77}},
+        },
+        {
+            "policy_id": "toxicity",
+            "detected": False,
+            "confidence": 0.5,
+            "detail": {"threshold": 0.75},
+        },
+    ]
+    near_misses = agent._collect_near_misses(scan_results, "input")
+    assert len(near_misses) == 1
+    assert near_misses[0]["policy_id"] == "pii-detection"
+    assert near_misses[0]["scope"] == "input"
+    assert near_misses[0]["violation_confidence"] == 0.77
+    assert near_misses[0]["threshold"] == 0.85
+    assert near_misses[0]["gap"] == pytest.approx(0.08, abs=0.001)
+
+
+def test_collect_near_misses_ignores_detected() -> None:
+    scan_results = [
+        {
+            "policy_id": "harmful-content",
+            "detected": True,
+            "confidence": 0.9,
+            "detail": {"threshold": 0.88},
+        }
+    ]
+    assert agent._collect_near_misses(scan_results, "output") == []
+
+
 def test_build_blocked_result() -> None:
     user_input = "blocked request"
     remediation_actions = [

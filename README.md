@@ -61,8 +61,20 @@ pytest test_agent.py -v
 }
 ```
 
-## Streamlit deploy
+## Streamlit UI
 
-Use `requirements.txt` as your Streamlit `packages` file. Add `streamlit` there only when you add a UI — keep it separate from the MCP/agent core if you do not need it in production.
+**Local** (port **8503** via `.streamlit/config.toml` — 8501 = AML knowledge base, 8502 = other app):
 
-**Note:** The agent spawns `server.py` as a subprocess; hosted Streamlit may need extra configuration for subprocess/stdio MCP.
+```bash
+streamlit run app.py
+# or
+.\run_app.ps1
+# different port if needed:
+streamlit run app.py --server.port 8504
+```
+
+**Streamlit Community Cloud** ignores `server.port` in config and serves on **8501** automatically.
+
+Use `requirements.txt` as your Streamlit Cloud `packages` file (includes `streamlit`, no `pywin32`).
+
+**Note:** The agent spawns `server.py` as a subprocess; hosted Streamlit needs `ANTHROPIC_API_KEY` in app secrets.

@@ -1,0 +1,5 @@
+# Local development: use 8503 (8501 = AML knowledge base, 8502 = other app).
+# Streamlit Community Cloud ignores server.port and always serves on 8501.
+
+[server]
+port = 8503
