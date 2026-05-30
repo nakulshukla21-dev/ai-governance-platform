@@ -1,6 +1,13 @@
 # AI Governance Platform
 
-A governed AI assistant for financial services teams. Every user message and model response is checked against organizational policies before and after the model answers — with clear outcomes for compliance, security, and audit.
+An end-to-end **AI governance workbench** for financial services teams — not just a governed chatbot. It combines **real-time policy enforcement** on LLM interactions, a **compliance escalation queue** for human review, **policy synthesis** from regulatory and internal documents, and a full **audit and versioning** trail.
+
+| Capability | What it does |
+|------------|----------------|
+| **Governed chat** | Role checks, input/output policy scans, block / redact / warn / escalate, governed Sonnet responses |
+| **Escalation queue** | Surfaces escalations and near misses for reviewer disposition, notes, and threshold tuning |
+| **Policy synthesis** | Turns allowlisted regulatory sources and internal PDFs into candidate rules for `policies.json` |
+| **Policy operations** | Live dashboard, JSON upload, version history, restore, and validated saves |
 
 ---
 
@@ -8,14 +15,17 @@ A governed AI assistant for financial services teams. Every user message and mod
 
 ### What is this?
 
-The AI Governance Platform wraps a large language model (Claude) in a **policy enforcement layer** designed for regulated environments. Users interact through a familiar chat interface, but the system:
+The AI Governance Platform is a **demo-grade RegTech control plane** around Claude: enforce rules at runtime, **operate** those rules over time, and **grow** them from external policy text — with reviewers kept in the loop.
 
-- Verifies **who** is asking (role-based access)
-- Scans **what** they send and **what** the model returns
-- Takes **automatic action** when policies are violated (block, redact, warn, or escalate)
-- Leaves an **audit trail** for reviewers
+**Governed chat** wraps Sonnet in a policy engine (regex + Haiku scoring). Every turn verifies **who** is asking, scans **input and output**, applies remediation automatically, and records what happened.
 
-Think of it as guardrails plus a paper trail — not just a chatbot.
+**Escalation queue** is where compliance work continues after automation: flagged confidential-data hits, policy-driven escalations, and **near misses** (scores just below threshold) appear in one session queue. Reviewers mark True Positive / False Positive / Near Miss, add notes, and adjust thresholds where appropriate.
+
+**Policy synthesis** closes the loop from law and policy PDFs to enforceable configuration: select trusted regulatory sources (EU AI Act, NIST, MAS, UK, FATF, India) and/or upload internal documents, extract obligations with Sonnet, human-review each candidate rule, and commit approved rules into the live policy set.
+
+**Audit trail and policy versioning** support demonstrations and pilot reviews — redacted session logs, CSV export, dashboard toggles, upload validation, and restore from version history.
+
+Together, these pieces model how a regulated firm might **deploy**, **supervise**, and **evolve** AI guardrails — beyond a single chat window with a system prompt.
 
 ### Who is it for?
 
@@ -29,6 +39,8 @@ Think of it as guardrails plus a paper trail — not just a chatbot.
 Roles are enforced before the model is called, so unauthorized query types are stopped early with a plain-language explanation.
 
 ### Key features
+
+The Streamlit app has four tabs: **Chat**, **Audit Trail**, **Escalation Queue**, and **Policy Synthesis**. The sidebar hosts the live **Policy Dashboard**.
 
 **Governed chat**
 
@@ -55,14 +67,14 @@ Detection combines **rules (regex)** and **AI scoring (Claude Haiku)** where con
 
 When content scores close to a policy threshold but does not quite trigger a violation, the system records a **near miss** — useful for tuning policies before real incidents occur.
 
-**Escalation queue**
+**Escalation queue** (dedicated tab)
 
-Compliance reviewers see session items that need attention:
+A reviewer-facing queue — not buried in chat logs. Session items that need human judgment are collected in one place:
 
-- Escalations (e.g. confidential-data policy)
-- Near misses (threshold tuning candidates)
+- **Escalations** from policies configured with `action: escalate` (e.g. confidential-data)
+- **Near misses** when confidence falls just below threshold (tuning signal before a real breach)
 
-Reviewers can mark items True Positive / False Positive / Near Miss, add notes, and **adjust thresholds** for near-miss policies.
+For each row, reviewers can record disposition (True Positive / False Positive / Near Miss), add notes, and **adjust input/output thresholds** on near-miss policies without leaving the app.
 
 **Audit trail**
 
