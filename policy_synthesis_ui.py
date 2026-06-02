@@ -118,8 +118,8 @@ def render_policy_synthesis_tab(
     _init_synthesis_state()
     st.subheader("Policy Synthesis")
     st.caption(
-        "Extract candidate enforcement rules from internal PDFs and pre-approved "
-        "regulatory sources. Review and commit approved rules to policies.json."
+        "Ingest internal PDFs and/or allowlisted regulators → Sonnet extracts obligation-based "
+        "candidate rules → you review and batch-commit into policies.json (sidebar dashboard updates)."
     )
 
     selected_sources = []

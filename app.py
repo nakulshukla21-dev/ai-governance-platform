@@ -241,6 +241,90 @@ def render_governance_details(result: InteractionResult) -> None:
             st.caption("None.")
 
 
+def render_platform_guide() -> None:
+    """In-app overview: what the platform does and how to use each area."""
+    if "guide_dismissed" not in st.session_state:
+        st.session_state.guide_dismissed = False
+
+    with st.expander(
+        "What is this platform? How to use it",
+        expanded=not st.session_state.guide_dismissed,
+    ):
+        st.markdown(
+            """
+This is an **AI governance workbench** for regulated financial services — not only a chatbot.
+It shows how a firm might **enforce**, **supervise**, and **evolve** guardrails around Claude.
+
+**What happens on each chat message**
+
+1. Your **role** is checked (permitted vs restricted query types).
+2. **Input** is scanned against enabled policies (regex + Claude Haiku).
+3. If allowed, **Claude Sonnet** generates a governed answer.
+4. **Output** is scanned again; violations can block, redact, warn, or flag escalation.
+5. The interaction is stored in the **Audit Trail**; escalations and near misses go to the **Escalation Queue**.
+
+The policy engine runs as a background MCP service; rules live in `config/policies.json`
+and reload when you save or commit changes.
+            """
+        )
+
+        st.markdown("**Sidebar — Policy Dashboard**")
+        st.markdown(
+            """
+- Choose a **Role** (Admin, Compliance Officer, Analyst, Customer Service) — this controls authorization.
+- **Enable/disable** policies and adjust thresholds, then **Save policy changes**.
+- **Upload** a replacement `policies.json` (validated) or **restore** an earlier version.
+            """
+        )
+
+        st.markdown("**Chat tab**")
+        st.markdown(
+            """
+Send a message like a normal assistant. Open **Governance Details** on each reply to see
+query type, policies scanned, violations, remediation, and near misses.
+            """
+        )
+
+        st.markdown("**Audit Trail tab**")
+        st.markdown(
+            """
+Session log of every governed interaction (redacted for demo safety). Review summaries,
+inspect full JSON, and **export CSV** for offline review.
+            """
+        )
+
+        st.markdown("**Escalation Queue tab**")
+        st.markdown(
+            """
+Reviewer workflow for items that need a human:
+
+- **Escalated** — e.g. confidential-data policy fired with `action: escalate`.
+- **Near miss** — confidence was close to threshold but did not trigger.
+
+Select a row, add notes, mark True Positive / False Positive / Near Miss, and tune thresholds
+for near-miss policies when appropriate.
+            """
+        )
+
+        st.markdown("**Policy Synthesis tab**")
+        st.markdown(
+            """
+Turn **internal PDFs** and/or **allowlisted regulatory sources** (EU AI Act, NIST, MAS, UK, FATF, India)
+into **candidate enforcement rules**:
+
+1. Select sources / upload PDFs → **Extract Obligations** (Sonnet).
+2. Review and edit each candidate → check the approval box → **Mark as approved**.
+3. **Commit all approved rules** — validated write to `policies.json`, backup, policy engine reload.
+
+Candidates are for engineering review, not legal advice.
+            """
+        )
+
+        if st.button("Collapse guide for this session", key="dismiss_platform_guide"):
+            st.session_state.guide_dismissed = True
+            st.rerun()
+
+
 def build_conversation_history(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     """History for agent: all completed turns before the latest user message."""
     history: list[dict[str, str]] = []
@@ -347,6 +431,10 @@ def render_policy_dashboard() -> None:
 
 def render_chat_tab(role_id: str) -> None:
     st.subheader("Governed Chat")
+    st.caption(
+        "Messages are classified by role, scanned before and after the model responds, "
+        "then logged to Audit Trail. Escalations and near misses appear in the Escalation Queue."
+    )
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -499,7 +587,8 @@ def apply_threshold_adjustment(
 def render_audit_trail_tab() -> None:
     st.subheader("Session Audit Trail")
     st.caption(
-        "Audit entries are redacted for demo safety. Exports do not include raw PII."
+        "Every Chat interaction in this browser session is recorded here (redacted). "
+        "Use this for demo audits and CSV export — not a production compliance archive."
     )
 
     if not st.session_state.audit_trail:
@@ -536,6 +625,10 @@ def render_audit_trail_tab() -> None:
 
 def render_escalation_queue_tab() -> None:
     st.subheader("Escalation Queue")
+    st.caption(
+        "Human review for policy escalations and near-miss signals from Chat. "
+        "Disposition and threshold changes apply to this session's audit data and live policies."
+    )
 
     items = escalation_queue_items()
     if not items:
@@ -682,7 +775,11 @@ def main() -> None:
         )
 
     st.title("AI Governance Platform")
-    st.caption("Governed financial services assistant with policy enforcement")
+    st.caption(
+        "Governance workbench: enforced chat, escalation review, policy synthesis, and audit — "
+        "built for financial services demos."
+    )
+    render_platform_guide()
 
     with st.sidebar:
         role_labels = list(ROLE_OPTIONS.keys())
